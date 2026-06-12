@@ -1,18 +1,18 @@
 """
-Desktop Pet for Windows — v3 "Playtime"
----------------------------------------
+Desktop Pet for Windows — v4 "Grand Entrance"
+---------------------------------------------
 New in this version:
-- PER-STATE ANIMATIONS: put idle.gif, walk.gif, jump.gif next to the
-  script and he'll use the right animation for each action.
-  Any that are missing fall back to pet.png / pet.gif automatically.
-- BALL PLAY: every few minutes a ball appears. He chases it and
-  kicks it around the screen for a while. (You can also press 'b'
-  while the pet is focused... or just wait.)
-- He flips to face the direction he's walking.
-- Still: wanders, idle-bobs, and jumps every JUMP_INTERVAL.
+- ENTRANCE ANIMATION: if entrance.gif exists, it plays once when the
+  pet starts up (e.g. stepping out of the Anywhere Door), then he
+  switches to his normal idle/walk/jump/play life.
+
+State files (all optional, fall back to pet.png):
+  entrance.gif - played once at startup
+  idle.gif     - standing around / sleeping
+  walk.gif     - walking and chasing the ball
+  jump.gif     - jumping
 
 Requires: pip install pillow
-
 Right-click the pet to quit. Left-click + drag to move him.
 """
 
@@ -27,20 +27,22 @@ except ImportError:
     sys.exit(1)
 
 # ---------------- Settings ----------------
-PET_IMAGE = "pet.png"        # fallback image if state files are missing
-STATE_FILES = {              # optional per-state animations
+PET_IMAGE = "pet.png"
+STATE_FILES = {
+    "entrance": "entrance.gif",
     "idle": "idle.gif",
     "walk": "walk.gif",
     "jump": "jump.gif",
 }
 PET_SCALE = 0.25
-JUMP_INTERVAL_MS = 5 * 60 * 1000   # solo jump every 5 minutes
-PLAY_INTERVAL_MS = 3 * 60 * 1000   # ball play session every 3 minutes
-PLAY_DURATION_MS = 20 * 1000       # each play session lasts ~20 seconds
+ENTRANCE_LOOPS = 1                 # how many times the entrance plays
+JUMP_INTERVAL_MS = 5 * 60 * 1000
+PLAY_INTERVAL_MS = 3 * 60 * 1000
+PLAY_DURATION_MS = 20 * 1000
 WANDER_INTERVAL_MS = 4000
 WANDER_CHANCE = 0.5
 MOVE_STEP = 4
-CHASE_STEP = 6                     # he runs faster when chasing the ball
+CHASE_STEP = 6
 JUMP_HEIGHT = 60
 BOB_PIXELS = 3
 BOB_SPEED_MS = 400
@@ -52,7 +54,6 @@ TRANSPARENT_COLOR = "#ff00fe"
 
 
 def load_animation(path, scale):
-    """Load an image/GIF into (right_frames, left_frames) lists."""
     right, left = [], []
     img = Image.open(path)
     for frame in ImageSequence.Iterator(img):
@@ -69,15 +70,13 @@ def load_animation(path, scale):
 
 
 class Ball:
-    """A bouncing ball in its own borderless window."""
-
     GRAVITY = 1.2
-    BOUNCE = 0.75       # energy kept after hitting the ground
+    BOUNCE = 0.75
     FRICTION = 0.995
 
     def __init__(self, master, screen_w, ground_y):
         self.screen_w = screen_w
-        self.ground_y = ground_y + 20  # ball rolls a bit below pet's feet
+        self.ground_y = ground_y + 20
         self.win = tk.Toplevel(master)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
@@ -138,7 +137,6 @@ class DesktopPet:
         except tk.TclError:
             pass
 
-        # Load animations: each state -> (right_frames, left_frames)
         self.anims = {}
         fallback = None
         try:
@@ -149,14 +147,15 @@ class DesktopPet:
             try:
                 self.anims[state] = load_animation(fname, PET_SCALE)
             except Exception:
-                if fallback:
+                # no fallback for entrance: if missing, we just skip it
+                if fallback and state != "entrance":
                     self.anims[state] = fallback
-        if not self.anims:
+        if "idle" not in self.anims:
             print(f"Couldn't load '{PET_IMAGE}' or any state GIFs.")
             sys.exit(1)
 
         self.state = "idle"
-        self.facing = 1          # 1 = right, -1 = left
+        self.facing = 1
         self.frame_index = 0
 
         first = self.anims["idle"][0][0]
@@ -183,9 +182,33 @@ class DesktopPet:
         self.bob_up = True
         self.ball = None
         self.playing = False
+        self.entering = False
 
         self.root.after(GIF_FRAME_MS, self._animate)
         self.root.after(BOB_SPEED_MS, self._idle_bob)
+
+        # --- entrance, then normal life ---
+        if "entrance" in self.anims:
+            self._play_entrance()
+        else:
+            self._start_life()
+
+    # ---------- entrance ----------
+    def _play_entrance(self):
+        self.entering = True
+        self.moving = True          # blocks bob/wander during entrance
+        self._set_state("entrance")
+        n_frames = len(self.anims["entrance"][0])
+        duration = n_frames * GIF_FRAME_MS * ENTRANCE_LOOPS
+        self.root.after(duration, self._finish_entrance)
+
+    def _finish_entrance(self):
+        self.entering = False
+        self.moving = False
+        self._set_state("idle")
+        self._start_life()
+
+    def _start_life(self):
         self.root.after(WANDER_INTERVAL_MS, self._maybe_wander)
         self.root.after(JUMP_INTERVAL_MS, self._jump)
         self.root.after(PLAY_INTERVAL_MS, self._start_play)
@@ -211,14 +234,14 @@ class DesktopPet:
 
     # ---------- animation loop ----------
     def _animate(self):
-        frames = self.anims.get(self.state, next(iter(self.anims.values())))
+        frames = self.anims.get(self.state, self.anims["idle"])
         side = frames[0] if self.facing == 1 else frames[1]
         self.frame_index = (self.frame_index + 1) % len(side)
         self.label.config(image=side[self.frame_index])
         self.root.after(GIF_FRAME_MS, self._animate)
 
     def _idle_bob(self):
-        if not self.moving and not self.playing:
+        if not self.moving and not self.playing and not self.entering:
             self.y = self.ground_y - (BOB_PIXELS if self.bob_up else 0)
             self.bob_up = not self.bob_up
             self._place()
@@ -292,14 +315,13 @@ class DesktopPet:
 
     # ---------- ball play ----------
     def _start_play(self, *_):
-        if self.playing:
+        if self.playing or self.entering:
             return
         self.playing = True
         self.moving = False
         self.ball = Ball(self.root, self.screen_w, self.ground_y + self.h - BALL_SIZE)
         self.root.after(PLAY_DURATION_MS, self._end_play)
         self._chase()
-        # schedule the next session
         self.root.after(PLAY_INTERVAL_MS, self._start_play)
 
     def _chase(self):
@@ -316,10 +338,8 @@ class DesktopPet:
             self.y = self.ground_y - (4 if (self.x // 12) % 2 == 0 else 0)
             self._place()
         else:
-            # close enough — KICK! (only if ball is near the ground)
             if self.ball.y > self.ground_y - 60:
                 self.ball.kick(1 if self.facing == 1 else -1)
-                # happy little hop after a kick
                 if not self.moving:
                     self._mini_hop()
         self.root.after(25, self._chase)
