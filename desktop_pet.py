@@ -36,7 +36,7 @@ STATE_FILES = {
 }
 PET_SCALE = 0.25
 ENTRANCE_LOOPS = 1                 # how many times the entrance plays
-ENTRANCE_INTERVAL_MS = 2 * 60 * 1000   # re-enter through the door every 2 min
+ENTRANCE_INTERVAL_MS = 15 * 1000   # re-enter through the door every 2 min
 JUMP_INTERVAL_MS = 5 * 60 * 1000
 PLAY_INTERVAL_MS = 3 * 60 * 1000
 PLAY_DURATION_MS = 20 * 1000
@@ -190,17 +190,24 @@ class DesktopPet:
 
         # --- entrance, then normal life ---
         if "entrance" in self.anims:
-            self._play_entrance(on_finish=self._start_life)
+            # first entrance happens where he starts; later ones teleport
+            self._play_entrance(on_finish=self._start_life, teleport=False)
         else:
             self._start_life()
 
     # ---------- entrance ----------
-    def _play_entrance(self, on_finish=None):
+    def _play_entrance(self, on_finish=None, teleport=True):
         # don't interrupt a jump or ball session in progress
         if self.playing or self.entering:
             return
         self.entering = True
         self.moving = True          # blocks bob/wander during entrance
+        # the Anywhere Door drops him somewhere new on the screen
+        if teleport:
+            self.x = random.randint(0, max(0, self.screen_w - self.w))
+            self.y = self.ground_y
+            self.facing = random.choice([-1, 1])
+            self._place()
         self._set_state("entrance")
         n_frames = len(self.anims["entrance"][0])
         duration = n_frames * GIF_FRAME_MS * ENTRANCE_LOOPS
