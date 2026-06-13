@@ -1,20 +1,38 @@
 """
-Desktop Pet for Windows — v4 "Grand Entrance"
----------------------------------------------
-New in this version:
-- ENTRANCE ANIMATION: if entrance.gif exists, it plays once when the
-  pet starts up (e.g. stepping out of the Anywhere Door), then he
-  switches to his normal idle/walk/jump/play life.
+Desktop Pet for Windows — v6 "Catch That Cursor"
+------------------------------------------------
+A director wakes up every ACTIVITY_INTERVAL and, if Doraemon is idle,
+picks ONE random thing to do:
+
+  wander        - stroll a short distance at his current level
+  jump          - hop in place
+  teleport      - step through the Anywhere Door to a random spot AND a
+                  random height, then wander off
+  play          - door DOWN to the real floor, then chase & kick the ball
+  chase_cursor  - follow your mouse pointer around the screen for a bit
 
 State files (all optional, fall back to pet.png):
-  entrance.gif - played once at startup
+  entrance.gif - the Anywhere Door animation (used for teleport & play)
   idle.gif     - standing around / sleeping
-  walk.gif     - walking and chasing the ball
+  walk.gif     - walking, chasing the ball, chasing the cursor
   jump.gif     - jumping
 
 Requires: pip install pillow
 Right-click the pet to quit. Left-click + drag to move him.
 """
+
+# -----------------------------------------------------------------------------
+# GITHUB / VERSION CONTROL REMINDER
+# After editing this file, save the change to your repo so you keep a history.
+# Run these from inside your Desktop-Pet folder:
+#     git add desktop_pet.py
+#     git commit -m "Add mouse-cursor chasing activity"
+#     git push
+# (One-time setup, if you haven't already:
+#     git init
+#     git remote add origin <your-repo-url>
+#     git push -u origin main )
+# -----------------------------------------------------------------------------
 
 import tkinter as tk
 import random
@@ -35,19 +53,29 @@ STATE_FILES = {
     "jump": "jump.gif",
 }
 PET_SCALE = 0.25
-ENTRANCE_LOOPS = 1                 # how many times the entrance plays
-ENTRANCE_INTERVAL_MS = 15 * 1000   # re-enter through the door every 2 min
-JUMP_INTERVAL_MS = 5 * 60 * 1000
-PLAY_INTERVAL_MS = 3 * 60 * 1000
+
+# How often the director considers doing something new (ms).
+ACTIVITY_INTERVAL_MS = 12 * 1000
+# Relative chance of each activity. Bigger = more often.
+ACTIVITY_WEIGHTS = {
+    "wander":       4,
+    "teleport":     2,
+    "jump":         2,
+    "play":         1,
+    "chase_cursor": 2,
+}
+
+ENTRANCE_LOOPS = 1
 PLAY_DURATION_MS = 20 * 1000
-WANDER_INTERVAL_MS = 4000
-WANDER_CHANCE = 0.5
+CURSOR_CHASE_DURATION_MS = 8 * 1000   # how long he follows the mouse
+CURSOR_CHASE_STEP = 7                 # how fast he follows it (px/frame)
 MOVE_STEP = 4
 CHASE_STEP = 6
 JUMP_HEIGHT = 60
 BOB_PIXELS = 3
 BOB_SPEED_MS = 400
 GIF_FRAME_MS = 100
+GROUND_MARGIN = 60        # how far above the taskbar the real floor sits
 BALL_SIZE = 36
 BALL_COLOR = "#e74c3c"
 BALL_COLOR2 = "#f1c40f"
@@ -138,6 +166,7 @@ class DesktopPet:
         except tk.TclError:
             pass
 
+        # ---- load animations ----
         self.anims = {}
         fallback = None
         try:
@@ -148,7 +177,6 @@ class DesktopPet:
             try:
                 self.anims[state] = load_animation(fname, PET_SCALE)
             except Exception:
-                # no fallback for entrance: if missing, we just skip it
                 if fallback and state != "entrance":
                     self.anims[state] = fallback
         if "idle" not in self.anims:
@@ -169,71 +197,174 @@ class DesktopPet:
         self.h = first.height()
         self.screen_w = self.root.winfo_screenwidth()
         self.screen_h = self.root.winfo_screenheight()
+
+        # real_ground_y = true floor; ground_y = his CURRENT walking level
+        # (may float high after a teleport). Play always returns to
+        # real_ground_y so the ball's gravity has somewhere to land.
+        self.real_ground_y = self.screen_h - self.h - GROUND_MARGIN
+        self.ground_y = self.real_ground_y
         self.x = self.screen_w // 2
-        self.ground_y = self.screen_h - self.h - 60
         self.y = self.ground_y
         self._place()
 
         self.label.bind("<Button-3>", lambda e: self.root.destroy())
         self.label.bind("<Button-1>", self._start_drag)
         self.label.bind("<B1-Motion>", self._on_drag)
-        self.root.bind("<KeyPress-b>", lambda e: self._start_play())
+        # handy test keys (click the pet first so it has focus):
+        #   p = play, t = teleport, j = jump, c = chase cursor
+        self.root.bind("<KeyPress-p>", lambda e: self._activity_play())
+        self.root.bind("<KeyPress-t>", lambda e: self._activity_teleport())
+        self.root.bind("<KeyPress-j>", lambda e: self._activity_jump())
+        self.root.bind("<KeyPress-c>", lambda e: self._activity_chase_cursor())
 
         self.moving = False
         self.bob_up = True
         self.ball = None
         self.playing = False
         self.entering = False
+        self.chasing_cursor = False
 
         self.root.after(GIF_FRAME_MS, self._animate)
         self.root.after(BOB_SPEED_MS, self._idle_bob)
 
-        # --- entrance, then normal life ---
+        # First arrival happens where he starts (no teleport), then the
+        # director takes over and runs his random life.
         if "entrance" in self.anims:
-            # first entrance happens where he starts; later ones teleport
-            self._play_entrance(on_finish=self._start_life, teleport=False)
+            self._play_entrance(on_finish=self._start_director,
+                                 teleport=False, wander_after=False)
         else:
-            self._start_life()
+            self._start_director()
 
-    # ---------- entrance ----------
-    def _play_entrance(self, on_finish=None, teleport=True):
-        # don't interrupt a jump or ball session in progress
+    # ================= director =================
+    def _start_director(self):
+        self.root.after(ACTIVITY_INTERVAL_MS, self._next_activity)
+
+    def _busy(self):
+        return (self.moving or self.playing or self.entering
+                or self.chasing_cursor)
+
+    def _next_activity(self):
+        if not self._busy():
+            choices = list(ACTIVITY_WEIGHTS.keys())
+            weights = list(ACTIVITY_WEIGHTS.values())
+            pick = random.choices(choices, weights=weights, k=1)[0]
+            if pick == "wander":
+                self._activity_wander()
+            elif pick == "teleport":
+                self._activity_teleport()
+            elif pick == "jump":
+                self._activity_jump()
+            elif pick == "play":
+                self._activity_play()
+            elif pick == "chase_cursor":
+                self._activity_chase_cursor()
+        self.root.after(ACTIVITY_INTERVAL_MS, self._next_activity)
+
+    # ---- individual activities ----
+    def _activity_wander(self):
+        distance = random.randint(80, 300)
+        direction = random.choice([-1, 1])
+        target = max(0, min(self.screen_w - self.w,
+                            self.x + direction * distance))
+        self._walk_to(target)
+
+    def _activity_jump(self):
+        self._do_jump_animation()
+
+    def _activity_teleport(self):
+        if "entrance" in self.anims:
+            self._play_entrance(teleport=True, wander_after=True)
+        else:
+            self._activity_wander()
+
+    def _activity_play(self):
+        # He needs real gravity for the ball, so door DOWN to the real
+        # floor first (no random height here), then start playing.
+        if "entrance" in self.anims:
+            self._play_entrance(on_finish=self._begin_ball,
+                                 teleport=True, wander_after=False,
+                                 target_y=self.real_ground_y)
+        else:
+            self.ground_y = self.real_ground_y
+            self.y = self.ground_y
+            self._place()
+            self._begin_ball()
+
+    # ================= chase the mouse cursor =================
+    def _activity_chase_cursor(self):
+        if self._busy():
+            return
+        self.chasing_cursor = True
+        self._set_state("walk")
+        self.root.after(CURSOR_CHASE_DURATION_MS, self._end_cursor_chase)
+        self._chase_cursor_step()
+
+    def _chase_cursor_step(self):
+        if not self.chasing_cursor:
+            return
+        # global pointer position on screen
+        cx = self.root.winfo_pointerx()
+        cy = self.root.winfo_pointery()
+        # aim so his centre sits just under the pointer
+        target_x = cx - self.w / 2
+        target_y = cy - self.h / 2
+        target_x = max(0, min(self.screen_w - self.w, target_x))
+        target_y = max(0, min(self.screen_h - self.h, target_y))
+
+        dx = target_x - self.x
+        dy = target_y - self.ground_y
+        if abs(dx) > CURSOR_CHASE_STEP:
+            self.facing = 1 if dx > 0 else -1
+            self.x += CURSOR_CHASE_STEP * self.facing
+        if abs(dy) > CURSOR_CHASE_STEP:
+            self.ground_y += CURSOR_CHASE_STEP * (1 if dy > 0 else -1)
+        self.y = self.ground_y
+        self._place()
+        self.root.after(20, self._chase_cursor_step)
+
+    def _end_cursor_chase(self):
+        self.chasing_cursor = False
+        self._set_state("idle")
+
+    # ================= entrance / teleport =================
+    def _play_entrance(self, on_finish=None, teleport=True,
+                       wander_after=True, target_x=None, target_y=None):
         if self.playing or self.entering:
             return
         self.entering = True
-        self.moving = True          # blocks bob/wander during entrance
-        # the Anywhere Door drops him somewhere new on the screen
+        self.moving = True
         if teleport:
-            self.x = random.randint(0, max(0, self.screen_w - self.w))
-            self.y = self.ground_y
+            self.x = (target_x if target_x is not None
+                      else random.randint(0, max(0, self.screen_w - self.w)))
+            new_ground = (target_y if target_y is not None
+                          else random.randint(0, max(0, self.screen_h - self.h - GROUND_MARGIN)))
+            self.ground_y = new_ground
+            self.y = new_ground
             self.facing = random.choice([-1, 1])
             self._place()
         self._set_state("entrance")
         n_frames = len(self.anims["entrance"][0])
         duration = n_frames * GIF_FRAME_MS * ENTRANCE_LOOPS
-        self.root.after(duration, lambda: self._finish_entrance(on_finish))
+        self.root.after(duration,
+                        lambda: self._finish_entrance(on_finish,
+                                                      teleport and wander_after))
 
-    def _finish_entrance(self, on_finish=None):
+    def _finish_entrance(self, on_finish=None, wander_after=False):
         self.entering = False
         self.moving = False
         self._set_state("idle")
-        if on_finish:
+        if wander_after:
+            steps = random.randint(60, 160)
+            direction = self.facing
+            target = self.x + direction * steps
+            if target < 0 or target > self.screen_w - self.w:
+                target = self.x - direction * steps
+            target = max(0, min(self.screen_w - self.w, target))
+            self._walk_to(target, then=on_finish)
+        elif on_finish:
             on_finish()
 
-    def _recurring_entrance(self):
-        # only re-enter when he's not busy; otherwise just wait for next tick
-        if not self.moving and not self.playing and not self.entering:
-            self._play_entrance()
-        self.root.after(ENTRANCE_INTERVAL_MS, self._recurring_entrance)
-
-    def _start_life(self):
-        self.root.after(WANDER_INTERVAL_MS, self._maybe_wander)
-        self.root.after(JUMP_INTERVAL_MS, self._jump)
-        self.root.after(PLAY_INTERVAL_MS, self._start_play)
-        if "entrance" in self.anims:
-            self.root.after(ENTRANCE_INTERVAL_MS, self._recurring_entrance)
-
-    # ---------- helpers ----------
+    # ================= helpers =================
     def _place(self):
         self.root.geometry(f"+{int(self.x)}+{int(self.y)}")
 
@@ -250,9 +381,10 @@ class DesktopPet:
         self.x = self.root.winfo_x() + event.x - self._drag_dx
         self.y = self.root.winfo_y() + event.y - self._drag_dy
         self.ground_y = self.y
+        self.real_ground_y = self.y   # dropping him sets a new real floor
         self._place()
 
-    # ---------- animation loop ----------
+    # ================= animation loop =================
     def _animate(self):
         frames = self.anims.get(self.state, self.anims["idle"])
         side = frames[0] if self.facing == 1 else frames[1]
@@ -261,22 +393,13 @@ class DesktopPet:
         self.root.after(GIF_FRAME_MS, self._animate)
 
     def _idle_bob(self):
-        if not self.moving and not self.playing and not self.entering:
+        if not self._busy():
             self.y = self.ground_y - (BOB_PIXELS if self.bob_up else 0)
             self.bob_up = not self.bob_up
             self._place()
         self.root.after(BOB_SPEED_MS, self._idle_bob)
 
-    # ---------- wandering ----------
-    def _maybe_wander(self):
-        if not self.moving and not self.playing and random.random() < WANDER_CHANCE:
-            distance = random.randint(80, 300)
-            direction = random.choice([-1, 1])
-            target = max(0, min(self.screen_w - self.w,
-                                self.x + direction * distance))
-            self._walk_to(target)
-        self.root.after(WANDER_INTERVAL_MS, self._maybe_wander)
-
+    # ================= walking =================
     def _walk_to(self, target_x, then=None, speed=MOVE_STEP):
         self.moving = True
         self._set_state("walk")
@@ -299,50 +422,47 @@ class DesktopPet:
 
         step()
 
-    # ---------- jumping ----------
-    def _jump(self):
-        if not self.moving and not self.playing:
-            self._do_jump_animation()
-        self.root.after(JUMP_INTERVAL_MS, self._jump)
-
+    # ================= jumping =================
     def _do_jump_animation(self, then=None):
         self.moving = True
         self._set_state("jump")
         frames_up = 15
+        base = self.ground_y
 
         def up(i=0):
             if i >= frames_up:
                 down()
                 return
-            self.y = self.ground_y - JUMP_HEIGHT * (1 - ((frames_up - i) / frames_up) ** 2)
+            self.y = base - JUMP_HEIGHT * (1 - ((frames_up - i) / frames_up) ** 2)
             self._place()
             self.root.after(15, lambda: up(i + 1))
 
         def down(i=0):
             if i >= frames_up:
-                self.y = self.ground_y
+                self.y = base
                 self._place()
                 self.moving = False
                 self._set_state("idle")
                 if then:
                     then()
                 return
-            self.y = (self.ground_y - JUMP_HEIGHT) + JUMP_HEIGHT * (i / frames_up) ** 2
+            self.y = (base - JUMP_HEIGHT) + JUMP_HEIGHT * (i / frames_up) ** 2
             self._place()
             self.root.after(15, lambda: down(i + 1))
 
         up()
 
-    # ---------- ball play ----------
-    def _start_play(self, *_):
-        if self.playing or self.entering:
-            return
+    # ================= ball play =================
+    def _begin_ball(self):
         self.playing = True
         self.moving = False
-        self.ball = Ball(self.root, self.screen_w, self.ground_y + self.h - BALL_SIZE)
+        self.ground_y = self.real_ground_y      # play happens on the floor
+        self.y = self.ground_y
+        self._place()
+        self.ball = Ball(self.root, self.screen_w,
+                         self.real_ground_y + self.h - BALL_SIZE)
         self.root.after(PLAY_DURATION_MS, self._end_play)
         self._chase()
-        self.root.after(PLAY_INTERVAL_MS, self._start_play)
 
     def _chase(self):
         if not self.playing or not self.ball or not self.ball.alive:
@@ -366,22 +486,23 @@ class DesktopPet:
 
     def _mini_hop(self):
         self.moving = True
+        base = self.ground_y
 
         def up(i=0):
             if i >= 6:
                 down()
                 return
-            self.y -= 4
+            self.y = base - (i + 1) * 4
             self._place()
             self.root.after(15, lambda: up(i + 1))
 
         def down(i=0):
             if i >= 6:
-                self.y = self.ground_y
+                self.y = base
                 self._place()
                 self.moving = False
                 return
-            self.y += 4
+            self.y = base - (6 - i) * 4
             self._place()
             self.root.after(15, lambda: down(i + 1))
 
