@@ -36,6 +36,7 @@ STATE_FILES = {
 }
 PET_SCALE = 0.25
 ENTRANCE_LOOPS = 1                 # how many times the entrance plays
+ENTRANCE_INTERVAL_MS = 2 * 60 * 1000   # re-enter through the door every 2 min
 JUMP_INTERVAL_MS = 5 * 60 * 1000
 PLAY_INTERVAL_MS = 3 * 60 * 1000
 PLAY_DURATION_MS = 20 * 1000
@@ -189,29 +190,41 @@ class DesktopPet:
 
         # --- entrance, then normal life ---
         if "entrance" in self.anims:
-            self._play_entrance()
+            self._play_entrance(on_finish=self._start_life)
         else:
             self._start_life()
 
     # ---------- entrance ----------
-    def _play_entrance(self):
+    def _play_entrance(self, on_finish=None):
+        # don't interrupt a jump or ball session in progress
+        if self.playing or self.entering:
+            return
         self.entering = True
         self.moving = True          # blocks bob/wander during entrance
         self._set_state("entrance")
         n_frames = len(self.anims["entrance"][0])
         duration = n_frames * GIF_FRAME_MS * ENTRANCE_LOOPS
-        self.root.after(duration, self._finish_entrance)
+        self.root.after(duration, lambda: self._finish_entrance(on_finish))
 
-    def _finish_entrance(self):
+    def _finish_entrance(self, on_finish=None):
         self.entering = False
         self.moving = False
         self._set_state("idle")
-        self._start_life()
+        if on_finish:
+            on_finish()
+
+    def _recurring_entrance(self):
+        # only re-enter when he's not busy; otherwise just wait for next tick
+        if not self.moving and not self.playing and not self.entering:
+            self._play_entrance()
+        self.root.after(ENTRANCE_INTERVAL_MS, self._recurring_entrance)
 
     def _start_life(self):
         self.root.after(WANDER_INTERVAL_MS, self._maybe_wander)
         self.root.after(JUMP_INTERVAL_MS, self._jump)
         self.root.after(PLAY_INTERVAL_MS, self._start_play)
+        if "entrance" in self.anims:
+            self.root.after(ENTRANCE_INTERVAL_MS, self._recurring_entrance)
 
     # ---------- helpers ----------
     def _place(self):
